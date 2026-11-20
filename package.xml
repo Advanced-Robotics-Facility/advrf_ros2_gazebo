@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>advrf_ros2_gazebo</name>
+  <version>0.1.0</version>
+  <description>ADVRF ROS2 Gazebo Package</description>
+  <maintainer email="manuel.delucchi@iit.it">Manuel Delucchi</maintainer>
+  <maintainer email="hugo.pousseur@iit.it">Hugo Pousseur</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>advrf_ros2_interfaces</depend>
+
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>gz_sim_vendor</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

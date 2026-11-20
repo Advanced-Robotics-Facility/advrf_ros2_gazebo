@@ -1,0 +1,44 @@
+import os
+from pathlib import Path
+import json
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
+import xacro
+
+def setup(context):
+    def value(name):
+        return LaunchConfiguration(name).perform(context)
+
+    model = Path(value('model_file')).expanduser().resolve()
+    world = Path(value('world_file')).expanduser().resolve()
+    if not model.is_file() or not world.is_file():
+        raise ValueError('model_file and world_file must point to existing files')
+
+    robot_xml = xacro.process_file(str(model)).toxml()
+    paths = [value('resource_paths'), os.environ.get('GZ_SIM_RESOURCE_PATH', '')]
+    environment = {'GZ_SIM_RESOURCE_PATH': os.pathsep.join(p for p in paths if p)}
+    request = f'sdf: {json.dumps(robot_xml)}, name: {json.dumps(value("robot_name"))}'
+    return [
+        ExecuteProcess(cmd=['gz', 'sim', '-v', '3', str(world)], additional_env=environment, output='screen'),
+        ExecuteProcess(
+            cmd=['gz', 'service', '-s', f'/world/{value("world_name")}/create',
+                 '--reqtype', 'gz.msgs.EntityFactory', '--reptype', 'gz.msgs.Boolean',
+                 '--timeout', '60000', '--req', request],
+            additional_env=environment, output='screen'
+        ),
+    ]
+
+
+def generate_launch_description():
+    share = Path(get_package_share_directory('advrf_ros2_gazebo'))
+    return LaunchDescription([
+        DeclareLaunchArgument('model_file', description='Robot URDF or Xacro file'),
+        DeclareLaunchArgument('world_file', default_value=str(share / 'worlds/empty.sdf')),
+        DeclareLaunchArgument('world_name', default_value='empty', description='World name declared inside the SDF'),
+        DeclareLaunchArgument('robot_name', default_value='robot'),
+        DeclareLaunchArgument('resource_paths', default_value='', description='Colon-separated Gazebo resource directories'),
+        OpaqueFunction(function=setup),
+    ])
