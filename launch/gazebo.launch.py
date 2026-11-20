@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
 import json
+import uuid
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
+from launch.events import Shutdown
 import xacro
 
 def setup(context):
@@ -20,9 +22,21 @@ def setup(context):
     robot_xml = xacro.process_file(str(model)).toxml()
     paths = [value('resource_paths'), os.environ.get('GZ_SIM_RESOURCE_PATH', '')]
     environment = {'GZ_SIM_RESOURCE_PATH': os.pathsep.join(p for p in paths if p)}
+    plugin_paths = [str(Path(get_package_prefix('advrf_ros2_gazebo')) / 'lib'),
+                    os.environ.get('GZ_SIM_SYSTEM_PLUGIN_PATH', '')]
+    environment['GZ_SIM_SYSTEM_PLUGIN_PATH'] = os.pathsep.join(p for p in plugin_paths if p)
+    # Keep this server and its spawn request separate from other Gazebo sessions.
+    environment['GZ_PARTITION'] = 'advrf-' + uuid.uuid4().hex
     request = f'sdf: {json.dumps(robot_xml)}, name: {json.dumps(value("robot_name"))}'
     return [
-        ExecuteProcess(cmd=['gz', 'sim', '-v', '3', str(world)], additional_env=environment, output='screen'),
+        ExecuteProcess(
+            cmd=['gz', 'sim', '-s', '-v', '3', str(world)],
+            additional_env=environment, output='screen',
+            on_exit=[EmitEvent(event=Shutdown(reason='Gazebo server exited'))]),
+        ExecuteProcess(
+            cmd=['gz', 'sim', '-g', '-v', '3'],
+            additional_env=environment, output='screen',
+            on_exit=[EmitEvent(event=Shutdown(reason='Gazebo GUI closed'))]),
         ExecuteProcess(
             cmd=['gz', 'service', '-s', f'/world/{value("world_name")}/create',
                  '--reqtype', 'gz.msgs.EntityFactory', '--reptype', 'gz.msgs.Boolean',

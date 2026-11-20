@@ -17,7 +17,8 @@
   <exec_depend>xacro</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
-  <exec_depend>gz_sim_vendor</exec_depend>
+  <depend>gz_sim_vendor</depend>
+  <depend>gz_plugin_vendor</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
