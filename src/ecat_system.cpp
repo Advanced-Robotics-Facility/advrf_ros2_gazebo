@@ -1,6 +1,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
 
 #include <gz/sim/System.hh>
 #include <gz/sim/Model.hh>
@@ -17,9 +20,9 @@
 namespace advrf_ros2_gazebo {
 
 class EcatSystem : public gz::sim::System,
-                      public gz::sim::ISystemConfigure,
-                      public gz::sim::ISystemPreUpdate
-                     // public gz::sim::ISystemPostUpdate
+                   public gz::sim::ISystemConfigure,
+                   public gz::sim::ISystemPreUpdate
+                   // public gz::sim::ISystemPostUpdate
 {
 public:
     // Called once when Gazebo attaches this plugin to a model
@@ -35,23 +38,55 @@ public:
             std::cerr << "ADVRF Gazebo backend must be attached to a model" << std::endl;
             return;
         }
+        std::cout  << "EcatSystem loaded for model [" << model_.Name(_ecm) << "]" << std::endl;
 
-        if (!_sdf->HasElement("joint_name")) {
-            std::cerr << "EcatSystem requires <joint_name>." << std::endl;
+        if (!_sdf->HasElement("joint")) {
+            std::cerr << "EcatSystem requires <joint>." << std::endl;
             return;
         }
-        joint_name_ = _sdf->Get<std::string>("joint_name");
 
-        const auto topic = gz::transport::TopicUtils::AsValidTopic(
-            "/model/" + model_.Name(_ecm) + "/joint/" + joint_name_ + "/cmd_force");
-        if (topic.empty() || !node_.Subscribe(topic, &EcatSystem::OnCmdForce, this)) {
-            std::cerr << "Failed to subscribe to joint force topic [" << topic << "]." << std::endl;
-            return;
+        sdf::ElementPtr sdfCopy = _sdf->Clone();
+        auto jointElem = sdfCopy->GetElement("joint");
+
+        while (jointElem) {
+            if (!jointElem->HasElement("name")) {
+                std::cerr << "Each <joint> require a field <name> in xacro file" << std::endl;
+                return;
+            }
+
+            Joints joint;
+            joint.name = jointElem->Get<std::string>("name");
+            joint.id = jointElem->Get<int32_t>("id");
+            joint.effort_limit = jointElem->Get<double>("effort_limit");
+            joint.entity = model_.JointByName(_ecm, joint.name);
+            if (joint.entity == gz::sim::kNullEntity) 
+                return;
+            std::cout  << "Found joint: " << joint.name << std::endl;
+
+            const auto topic = gz::transport::TopicUtils::AsValidTopic("/model/" + model_.Name(_ecm) + "/joint/" + joint.name  + "/cmd_force");
+            if (topic.empty()) {
+                std::cerr << "Failed to subscribe to joint force topic [" << topic << "]." << std::endl;
+                return;
+            }
+
+            const bool subscribed =  node_.Subscribe<gz::msgs::Double>(
+                topic, 
+                [this, jointName = joint.name](const gz::msgs::Double &msg)
+                {
+                    this->OnCmdForce(jointName, msg);
+                }
+            );
+            if (!subscribed) {
+                std::cerr << "Failed to subscribe to [" << topic << "]." << std::endl;
+                return;
+            }
+            
+            std::cout  << "EcatSystem loaded for joint [" << joint.name 
+                << "], topic [" << topic << "]." << std::endl;
+            
+            joints_.push_back(std::move(joint));
+            jointElem = jointElem->GetNextElement("joint");
         }
-        
-        std::cout  << "EcatSystem loaded for model [" << model_.Name(_ecm)
-              << "], joint [" << joint_name_
-              << "], topic [" << topic << "]." << std::endl;
     }
 
     void PreUpdate(const gz::sim::UpdateInfo &_info,
@@ -60,20 +95,21 @@ public:
         if (_info.paused)
             return;
 
-        if (joint_entity_ == gz::sim::kNullEntity) {
-            joint_entity_ = model_.JointByName(_ecm, joint_name_);
-            if (joint_entity_ == gz::sim::kNullEntity)
-                return;
-            std::cout  << "Found joint: " << joint_name_ << std::endl;
-        }
+        std::lock_guard<std::mutex> lock(command_mutex_);
 
-        double command;
-        {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            command = joint_force_cmd_;
+        for (const auto &joint : joints_) {
+            const auto it = joint_force_cmd_.find(joint.name);
+            double command;
+            if (it != joint_force_cmd_.end()) {
+                command = std::clamp(it->second, -joint.effort_limit, joint.effort_limit);
+            }
+            else {
+                command = 0.0;
+            }
+        
+            auto *force = _ecm.ComponentDefault<gz::sim::components::JointForceCmd>(joint.entity, std::vector<double>{0.0});
+            force->Data()[0] = command;
         }
-        auto force = _ecm.ComponentDefault<gz::sim::components::JointForceCmd>(joint_entity_, {0.0});
-        force->Data()[0] += command;
     }
 
     // Called after each simulation update
@@ -83,19 +119,24 @@ public:
     // }
 
 private:
-    void OnCmdForce(const gz::msgs::Double &_msg) {
-        std::cout << "Received force command: " << _msg.data() << std::endl;
-
+    void OnCmdForce(const std::string &jointName, const gz::msgs::Double &_msg) {
         std::lock_guard<std::mutex> lock(command_mutex_);
-        joint_force_cmd_ = _msg.data();
+        joint_force_cmd_[jointName] = _msg.data();
+        std::cout << "Received force command for [" << jointName << "]: " << _msg.data() << std::endl;
     }
 
+    struct Joints {
+        std::string name;
+        int32_t id {0};
+        double effort_limit {0.0};
+        gz::sim::Entity entity{gz::sim::kNullEntity};
+    };
+
     gz::sim::Model model_{gz::sim::kNullEntity};
-    gz::sim::Entity joint_entity_{gz::sim::kNullEntity};
     gz::transport::Node node_;
 
-    std::string joint_name_;
-    double joint_force_cmd_{0.0};
+    std::vector<Joints> joints_;
+    std::unordered_map<std::string, double> joint_force_cmd_;
 
     std::mutex command_mutex_;
 };
