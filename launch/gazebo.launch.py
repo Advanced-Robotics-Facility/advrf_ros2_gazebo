@@ -25,8 +25,6 @@ def setup(context):
     plugin_paths = [str(Path(get_package_prefix('advrf_ros2_gazebo')) / 'lib'),
                     os.environ.get('GZ_SIM_SYSTEM_PLUGIN_PATH', '')]
     environment['GZ_SIM_SYSTEM_PLUGIN_PATH'] = os.pathsep.join(p for p in plugin_paths if p)
-    # Keep this server and its spawn request separate from other Gazebo sessions.
-    environment['GZ_PARTITION'] = 'advrf-' + uuid.uuid4().hex
     request = f'sdf: {json.dumps(robot_xml)}, name: {json.dumps(value("robot_name"))}'
     return [
         ExecuteProcess(

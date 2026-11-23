@@ -14,20 +14,23 @@ find_package(gz_plugin_vendor REQUIRED)
 find_package(gz_sim_vendor REQUIRED)
 find_package(gz-plugin2 REQUIRED COMPONENTS register)
 find_package(gz-sim8 REQUIRED)
+find_package(gz-transport13 REQUIRED)
 
 install(
   DIRECTORY worlds launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-add_library(joint_feedback SHARED src/joint_feedback.cpp)
-target_compile_features(joint_feedback PUBLIC cxx_std_17)
-target_link_libraries(joint_feedback
-  gz-plugin2::register
-  gz-sim8::gz-sim8
+add_library(ecat_system SHARED src/ecat_system.cpp)
+target_compile_features(ecat_system PUBLIC cxx_std_17)
+target_link_libraries(ecat_system
+  PRIVATE
+    gz-plugin2::register
+    gz-sim8::gz-sim8
+    gz-transport13::gz-transport13
 )
 
-install(TARGETS joint_feedback
+install(TARGETS ecat_system
   LIBRARY DESTINATION lib
 )
 
