@@ -22,7 +22,11 @@ def setup(context):
         raise ValueError('model_file and world_file must point to existing files')
 
     robot_xml = xacro.process_file(
-        str(model), mappings={'use_gz_ros2_control': value('use_gz_ros2_control')}
+        str(model), mappings={
+            'use_gz_ros2_control': value('use_gz_ros2_control'),
+            'gazebo_ecat_namespace': value('gazebo_ecat_namespace'),
+            'active_tx_on_first_msg': value('active_tx_on_first_msg'),
+        }
     ).toxml()
     paths = [value('resource_paths'), os.environ.get('GZ_SIM_RESOURCE_PATH', '')]
     environment = {'GZ_SIM_RESOURCE_PATH': os.pathsep.join(p for p in paths if p)}
@@ -64,6 +68,8 @@ def generate_launch_description():
         DeclareLaunchArgument('robot_name', default_value='robot'),
         DeclareLaunchArgument('resource_paths', default_value='', description='Colon-separated Gazebo resource directories'),
         DeclareLaunchArgument('use_gz_ros2_control', default_value='true'),
+        DeclareLaunchArgument('gazebo_ecat_namespace', default_value='/advrf/miranda/ecat'),
+        DeclareLaunchArgument('active_tx_on_first_msg', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('gui', default_value='true'),
         OpaqueFunction(function=setup),
     ])

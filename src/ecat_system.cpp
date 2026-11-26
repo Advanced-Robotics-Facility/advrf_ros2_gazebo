@@ -1,212 +1,325 @@
-#include <memory>
-#include <mutex>
-#include <rclcpp/executors.hpp>
-#include <rclcpp/publisher.hpp>
-#include <rclcpp/qos.hpp>
-#include <rclcpp/subscription.hpp>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <algorithm>
-
-#include <gz/sim/System.hh>
+#include <advrf_ros2_interfaces/msg/motor_tx_pdo.hpp>
+#include <gz/plugin/Register.hh>
 #include <gz/sim/Model.hh>
+#include <gz/sim/System.hh>
+#include <gz/sim/components/JointForceCmd.hh>
 #include <gz/sim/components/JointPosition.hh>
 #include <gz/sim/components/JointVelocity.hh>
-#include <gz/sim/components/JointForceCmd.hh>
-#include <gz/plugin/Register.hh>
-#include <gz/common/Console.hh>
-#include <gz/msgs/double.pb.h>
-#include <gz/transport/Node.hh>
-#include <gz/transport/TopicUtils.hh>
-
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
-#include "advrf_ros2_interfaces/msg/motor_tx_pdo.hpp"
+#include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 
-// https://gazebosim.org/api/sim/8/createsystemplugins.html
-// https://gazebosim.org/api/sim/8/usingcomponents.html
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <unordered_set>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-using MotorCommand = advrf_ros2_interfaces::msg::MotorTxPdo;
-using JointState = sensor_msgs::msg::JointState;
-
-namespace advrf_ros2_gazebo {
-
-class EcatSystem : public gz::sim::System,
-                   public gz::sim::ISystemConfigure,
-                   public gz::sim::ISystemPreUpdate,
-                   public gz::sim::ISystemPostUpdate
+namespace advrf_ros2_gazebo
+{
+class EcatSystem final : public gz::sim::System,
+                         public gz::sim::ISystemConfigure,
+                         public gz::sim::ISystemPreUpdate,
+                         public gz::sim::ISystemPostUpdate
 {
 public:
-    // Called once when Gazebo attaches this plugin to a model
-    // Parse SDF, Find Joints, Create ROS2 pub/sub
-    void Configure(const gz::sim::Entity &_entity,
-                   const std::shared_ptr<const sdf::Element> &_sdf,
-                   gz::sim::EntityComponentManager &_ecm,
-                   gz::sim::EventManager &/*_eventMgr*/) override
-    {
-        std::cout  << "Configure" << std::endl;
+  ~EcatSystem() override
+  {
+    if (executor_) executor_->cancel();
+    if (spin_thread_.joinable()) spin_thread_.join();
+  }
 
-        model_ = gz::sim::Model(_entity);
-        if (!model_.Valid(_ecm)) {
-            std::cerr << "ADVRF Gazebo backend must be attached to a model" << std::endl;
-            return;
-        }
-        std::cout  << "EcatSystem loaded for model [" << model_.Name(_ecm) << "]" << std::endl;
+  void Configure(const gz::sim::Entity &entity,
+                 const std::shared_ptr<const sdf::Element> &sdf,
+                 gz::sim::EntityComponentManager &ecm,
+                 gz::sim::EventManager &) override
+  {
+    model_ = gz::sim::Model(entity);
+    if (!model_.Valid(ecm))
+        throw std::runtime_error("ADVRF Gazebo backend must be attached to a model");
 
-        if (!_sdf->HasElement("joint")) {
-            std::cerr << "EcatSystem requires <joint>." << std::endl;
-            return;
-        }
+    // Params defined in .xacro file
+    namespace_ = sdf->Get<std::string>("ros_namespace", "/advrf/miranda/ecat").first;
+    command_timeout_ = std::chrono::milliseconds(sdf->Get<unsigned int>("command_timeout_ms", 100U).first);
+    feedback_period_ = std::chrono::milliseconds(sdf->Get<unsigned int>("feedback_period_ms", 4U).first);
+    auto_activate_ = sdf->Get<bool>("active_on_first_command", false).first;
+    startup_hold_ = sdf->Get<bool>("hold_initial_pose", false).first;
 
-        sdf::ElementPtr sdfCopy = _sdf->Clone();
-        auto jointElem = sdfCopy->GetElement("joint");
+    // Parse .xacro joints definition/params and save into Joint datastruct
+    std::unordered_set<std::string> names;
+    auto joint = sdf->FindElement("joint");
+    while (joint) {
+      Joint item;
+      item.name = joint->Get<std::string>("name");
+      item.id = joint->Get<int32_t>("id");
+      item.stiffness = joint->Get<double>("stiffness");
+      item.damping = joint->Get<double>("damping");
+      item.effort_limit = joint->Get<double>("effort_limit", 0.0).first;
+      item.entity = model_.JointByName(ecm, item.name);
+      if (item.entity == gz::sim::kNullEntity)
+        throw std::runtime_error("Gazebo model is missing joint: " + item.name);
+      if (!names.insert(item.name).second || by_id_.count(item.id))
+        throw std::runtime_error("Duplicate joint name or EtherCAT ID in Gazebo plugin");
+      by_id_[item.id] = joints_.size();
+      joints_.push_back(std::move(item));
+      joint = joint->GetNextElement("joint");
+    }
+    if (joints_.empty()) throw std::runtime_error("ADVRF Gazebo backend has no configured joints");
 
-        while (jointElem) {
-            if (!jointElem->HasElement("name")) {
-                std::cerr << "Each <joint> require a field <name> in xacro file" << std::endl;
-                return;
-            }
-
-            Joints joint;
-            joint.name = jointElem->Get<std::string>("name");
-            joint.id = jointElem->Get<int32_t>("id");
-            joint.effort_limit = jointElem->Get<double>("effort_limit");
-            joint.entity = model_.JointByName(_ecm, joint.name);
-            if (joint.entity == gz::sim::kNullEntity) 
-                return;
-            std::cout  << "Found joint: " << joint.name << std::endl;
-
-            const auto topic = gz::transport::TopicUtils::AsValidTopic("/model/" + model_.Name(_ecm) + "/joint/" + joint.name  + "/cmd_force");
-            if (topic.empty()) {
-                std::cerr << "Failed to subscribe to joint force topic [" << topic << "]." << std::endl;
-                return;
-            }
-
-            const bool subscribed =  gz_node_.Subscribe<gz::msgs::Double>(
-                topic, 
-                [this, jointName = joint.name](const gz::msgs::Double &msg)
-                {
-                    this->OnCmdForce(jointName, msg);
-                }
-            );
-            if (!subscribed) {
-                std::cerr << "Failed to subscribe to [" << topic << "]." << std::endl;
-                return;
-            }
-            
-            std::cout  << "EcatSystem loaded for joint [" << joint.name 
-                << "], topic [" << topic << "]." << std::endl;
-            
-            joints_.push_back(std::move(joint));
-            jointElem = jointElem->GetNextElement("joint");
-        }
-
-        if (!rclcpp::ok()) {
-            int argc = 0;
-            char **argv = nullptr;
-            rclcpp::init(argc, argv);
-        }
-        ros_node_ = std::make_shared<rclcpp::Node>("gazebo_ecat_system", "/advrf/miranda/ecat");
-        // cmd_sub_ = ros_node_->create_subscription<MotorCommand>(
-        //     "tx/motors",
-        //     rclcpp::QoS(1).reliable(),
-        //     [this](MotorCommand::ConstSharedPtr msg) 
-        //     {
-        //         std::lock_guard<std::mutex> lock(cmd_mutex_);
-        //         latest_cmd_ = *msg;
-        //         cmd_recv_ = true;
-        //     }
-        // );
-        state_pub_ = ros_node_->create_publisher<JointState>(
-            "rx/joint_state", 
-            rclcpp::SensorDataQoS()
-        );
+    // Initialize actuator components
+    for (const auto &item : joints_) {
+      ecm.CreateComponent(item.entity, gz::sim::components::JointPosition());
+      ecm.CreateComponent(item.entity, gz::sim::components::JointVelocity());
+      ecm.CreateComponent(item.entity, gz::sim::components::JointForceCmd({0.0}));
     }
 
-    // Called before each simulation update
-    // Process ROS2 cmds, read latest measured state, compute & write cmd
-    void PreUpdate(const gz::sim::UpdateInfo &_info,
-                   gz::sim::EntityComponentManager &_ecm) override
+    // ROS2 Init
+    if (!rclcpp::ok()) {
+      int argc = 0;
+      char **argv = nullptr;
+      rclcpp::init(argc, argv);
+    }
+
+    // ROS2 Node
+    node_ = std::make_shared<rclcpp::Node>("gazebo_ecat_backend", namespace_);
+
+    // ROS2 Pub/Sub
+    command_sub_ = node_->create_subscription<advrf_ros2_interfaces::msg::MotorTxPdo>(
+      "tx/motors",
+      rclcpp::QoS(1).best_effort(),
+      [this](advrf_ros2_interfaces::msg::MotorTxPdo::ConstSharedPtr msg)
+      {
+        command(*msg);
+      }
+    );
+    joint_pub_ = node_->create_publisher<sensor_msgs::msg::JointState>(
+      "rx/joint_states",
+      rclcpp::QoS(5).reliable()
+    );
+    active_pub_ = node_->create_publisher<std_msgs::msg::Bool>(
+      "active",
+      rclcpp::QoS(1).reliable().transient_local()
+    );
+    active_service_ = node_->create_service<std_srvs::srv::SetBool>(
+      "set_active_tx",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+             std::shared_ptr<std_srvs::srv::SetBool::Response> response)
     {
-        if (_info.paused)
-            return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto_activate_ = false;
+        have_command_ = false;
+        if (!request->data) startup_hold_ = false;
+        active_.store(request->data);
+        publish_active();
+        response->success = true;
+        response->message = request->data ? "Gazebo motor commands enabled" : "Gazebo motor commands disabled";
+      }
+    );
+    publish_active();
 
-        rclcpp::spin_some(ros_node_);
+    executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+    executor_->add_node(node_);
+    spin_thread_ = std::thread([this]() { executor_->spin(); });
+    RCLCPP_INFO(node_->get_logger(), "Gazebo EtherCAT backend ready for %zu joints", joints_.size());
+  }
 
-        std::lock_guard<std::mutex> lock(command_mutex_);
+  void PreUpdate(const gz::sim::UpdateInfo &info,
+                 gz::sim::EntityComponentManager &ecm) override
+  {
+    if (info.paused)
+        return;
 
-        for (const auto &joint : joints_) {
-            const auto it = joint_force_cmd_.find(joint.name);
-            double command;
-            if (it != joint_force_cmd_.end()) {
-                command = std::clamp(it->second, -joint.effort_limit, joint.effort_limit);
-            }
-            else {
-                command = 0.0;
-            }
-        
-            auto *force = _ecm.ComponentDefault<gz::sim::components::JointForceCmd>(joint.entity, std::vector<double>{0.0});
-            force->Data()[0] = command;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // simulation-reset safety guard
+    if (info.dt < decltype(info.dt)::zero())
+      have_command_ = false;
+
+    // Watchdog
+    const bool fresh = have_command_ && (std::chrono::steady_clock::now() - last_command_ <= command_timeout_);
+
+    for (auto &joint : joints_) {
+      // Read simulated joint state from Gazebo
+      const auto position = scalar<gz::sim::components::JointPosition>(ecm, joint.entity);
+      const auto velocity = scalar<gz::sim::components::JointVelocity>(ecm, joint.entity);
+      double effort = 0.0;
+      if (position && velocity) {
+        if (startup_hold_) {
+          if (!joint.initial_position)
+            joint.initial_position = *position;
+          // QDD (Quasi-Direct Drive) Actuator Equation
+          effort = joint.stiffness * (*joint.initial_position - *position) - joint.damping * *velocity;
+        } else if (active_.load() && fresh && joint.commanded) {
+          effort = joint.torque + joint.kp * (joint.position - *position) + joint.kd * (joint.velocity - *velocity);
         }
-    }
+        effort = std::clamp(effort, -joint.effort_limit, joint.effort_limit);
+      }
+      joint.applied_effort = effort;
 
-    // Called after each simulation update
-    // Read new data, publish jointstate
-    void PostUpdate(const gz::sim::UpdateInfo &_info,
-                    const gz::sim::EntityComponentManager &_ecm) override
-    {
+      // Send torque command to Gazebo's physics solver
+      auto component = ecm.Component<gz::sim::components::JointForceCmd>(joint.entity);
+      if (component)
+        component->Data()[0] = effort;
+      else
+        ecm.CreateComponent(joint.entity, gz::sim::components::JointForceCmd({effort}));
     }
+  }
+
+  void PostUpdate(const gz::sim::UpdateInfo &info,
+                  const gz::sim::EntityComponentManager &ecm) override
+  {
+    if (info.dt < decltype(info.dt)::zero())
+        next_feedback_time_ = info.simTime;
+
+    if (info.paused || !joint_pub_ || info.simTime < next_feedback_time_)
+        return;
+    next_feedback_time_ = info.simTime + feedback_period_;
+
+    sensor_msgs::msg::JointState state;
+    const auto nanoseconds = info.simTime.count();
+    state.header.stamp.sec = static_cast<int32_t>(nanoseconds / 1000000000LL);
+    state.header.stamp.nanosec = static_cast<uint32_t>(nanoseconds % 1000000000LL);
+    state.name.reserve(joints_.size());
+    state.position.reserve(joints_.size());
+    state.velocity.reserve(joints_.size());
+    state.effort.reserve(joints_.size());
+    for (const auto &joint : joints_) {
+      const auto position = scalar<gz::sim::components::JointPosition>(ecm, joint.entity);
+      const auto velocity = scalar<gz::sim::components::JointVelocity>(ecm, joint.entity);
+      if (!position || !velocity) return;
+      state.name.push_back(joint.name);
+      state.position.push_back(*position);
+      state.velocity.push_back(*velocity);
+      state.effort.push_back(joint.applied_effort);
+    }
+    joint_pub_->publish(state);
+  }
 
 private:
-    void OnCmdForce(const std::string &jointName, const gz::msgs::Double &_msg) {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        joint_force_cmd_[jointName] = _msg.data();
-        std::cout << "Received force command for [" << jointName << "]: " << _msg.data() << std::endl;
+  struct Joint {
+    std::string name;
+    int32_t id{0};
+    gz::sim::Entity entity{gz::sim::kNullEntity};
+    double effort_limit{0.0};
+    double position{0.0};
+    double velocity{0.0};
+    double torque{0.0};
+
+    double stiffness{0.0};
+    double damping{0.0};
+    double kp{0.0};
+    double kd{0.0};
+
+    bool commanded{false};
+    double applied_effort{0.0};
+    std::optional<double> initial_position;
+  };
+
+  template<class Component>
+  static std::optional<double> scalar(const gz::sim::EntityComponentManager &ecm,
+                                      gz::sim::Entity entity)
+  {
+    const auto component = ecm.Component<Component>(entity);
+    if (!component || component->Data().empty() || !std::isfinite(component->Data()[0]))
+      return std::nullopt;
+    return component->Data()[0];
+  }
+
+  void command(const advrf_ros2_interfaces::msg::MotorTxPdo &msg)
+  {
+    const auto size = msg.ecat_id.size();
+    if (size == 0 || msg.pos_ref.size() != size || msg.vel_ref.size() != size ||
+        msg.tor_ref.size() != size || msg.gain_0.size() != size || msg.gain_1.size() != size)
+    {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Rejected malformed MotorTxPdo");
+      return;
     }
 
-    struct Joints {
-        std::string name;
-        int32_t id;
-        gz::sim::Entity entity{gz::sim::kNullEntity};
+    std::unordered_set<int32_t> seen;
+    for (std::size_t i = 0; i < size; ++i) {
+      if (!by_id_.count(msg.ecat_id[i]) || !seen.insert(msg.ecat_id[i]).second ||
+          !std::isfinite(msg.pos_ref[i]) || !std::isfinite(msg.vel_ref[i]) ||
+          !std::isfinite(msg.tor_ref[i]) || !std::isfinite(msg.gain_0[i]) ||
+          !std::isfinite(msg.gain_1[i]))
+      {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Rejected invalid motor reference or EtherCAT ID");
+        return;
+      }
+    }
 
-        double pos{0.0};
-        double vel{0.0};
-        double eff{0.0};
+    // Lock so PreUpdate cannot read half-updated targets mid loop
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_.load() && !auto_activate_)
+        return;
+    startup_hold_ = false;
 
-        double pos_ref{0.0};
-        double vel_ref{0.0};
-        double tor_ref{0.0};
+    for (auto &joint : joints_)
+        joint.commanded = false;
 
-        double stiffness{0.0};
-        double damping{0.0};
-        double kp{0.0};
-        double ki{0.0};
-        double kd{0.0};
+    for (std::size_t i = 0; i < size; ++i) {
+      auto &joint = joints_[by_id_.at(msg.ecat_id[i])];
+      joint.position = msg.pos_ref[i];
+      joint.velocity = msg.vel_ref[i];
+      joint.torque = msg.tor_ref[i];
+      joint.kp = msg.gain_0[i];
+      joint.kd = msg.gain_1[i];
+      joint.commanded = true;
+    }
 
-        double effort_limit{0.0};
-    };
+    if (!active_.exchange(true))
+        publish_active();
+    last_command_ = std::chrono::steady_clock::now();
+    have_command_ = true;
+  }
 
-    gz::sim::Model model_{gz::sim::kNullEntity};
-    gz::transport::Node gz_node_;
+  void publish_active()
+  {
+    if (!active_pub_) return;
+    std_msgs::msg::Bool msg;
+    msg.data = active_.load();
+    active_pub_->publish(msg);
+  }
 
-    std::vector<Joints> joints_;
-    std::unordered_map<std::string, double> joint_force_cmd_;
+  gz::sim::Model model_{gz::sim::kNullEntity};
+  std::string namespace_;
+  std::vector<Joint> joints_;
+  std::unordered_map<int32_t, std::size_t> by_id_;
+  std::mutex mutex_;
+  std::chrono::steady_clock::time_point last_command_;
+  std::chrono::milliseconds command_timeout_{100};
+  std::chrono::milliseconds feedback_period_{4};
+  std::chrono::steady_clock::duration next_feedback_time_{0};
+  bool have_command_{false};
+  std::atomic_bool active_{false};
+  bool auto_activate_{false};
+  bool startup_hold_{false};
 
-    std::mutex command_mutex_;
-
-    rclcpp::Node::SharedPtr ros_node_;
-    //rclcpp::Subscription<MotorCommand>::SharedPtr cmd_sub_;
-    rclcpp::Publisher<JointState>::SharedPtr state_pub_;
-    // MotorCommand latest_cmd_;
-    // bool cmd_recv_{false};
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Subscription<advrf_ros2_interfaces::msg::MotorTxPdo>::SharedPtr command_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr active_pub_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr active_service_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  std::thread spin_thread_;
 };
+}
 
-}  // namespace advrf_ros2_gazebo
-
-// Expose the class and its callbacks to Gazebo's plugin loader
 GZ_ADD_PLUGIN(advrf_ros2_gazebo::EcatSystem,
               gz::sim::System,
               advrf_ros2_gazebo::EcatSystem::ISystemConfigure,
               advrf_ros2_gazebo::EcatSystem::ISystemPreUpdate,
               advrf_ros2_gazebo::EcatSystem::ISystemPostUpdate)
+
+GZ_ADD_PLUGIN_ALIAS(advrf_ros2_gazebo::EcatSystem,
+                    "advrf_ros2_gazebo::EcatSystem")
