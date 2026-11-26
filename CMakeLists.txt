@@ -21,16 +21,21 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-add_library(ecat_system SHARED src/ecat_system.cpp)
-target_compile_features(ecat_system PUBLIC cxx_std_17)
-target_link_libraries(ecat_system
+add_library(advrf_gazebo_ecat_system SHARED src/ecat_system.cpp)
+target_compile_features(advrf_gazebo_ecat_system PUBLIC cxx_std_17)
+ament_target_dependencies(advrf_gazebo_ecat_system PUBLIC
+  rclcpp
+  advrf_ros2_interfaces  
+  sensor_msgs
+)
+target_link_libraries(advrf_gazebo_ecat_system
   PRIVATE
     gz-plugin2::register
     gz-sim8::gz-sim8
     gz-transport13::gz-transport13
 )
 
-install(TARGETS ecat_system
+install(TARGETS advrf_gazebo_ecat_system
   LIBRARY DESTINATION lib
 )
 

@@ -1,13 +1,15 @@
 import os
 from pathlib import Path
 import json
-import uuid
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
 from launch.events import Shutdown
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 import xacro
 
 def setup(context):
@@ -19,7 +21,9 @@ def setup(context):
     if not model.is_file() or not world.is_file():
         raise ValueError('model_file and world_file must point to existing files')
 
-    robot_xml = xacro.process_file(str(model)).toxml()
+    robot_xml = xacro.process_file(
+        str(model), mappings={'use_gz_ros2_control': value('use_gz_ros2_control')}
+    ).toxml()
     paths = [value('resource_paths'), os.environ.get('GZ_SIM_RESOURCE_PATH', '')]
     environment = {'GZ_SIM_RESOURCE_PATH': os.pathsep.join(p for p in paths if p)}
     plugin_paths = [str(Path(get_package_prefix('advrf_ros2_gazebo')) / 'lib'),
@@ -27,12 +31,19 @@ def setup(context):
     environment['GZ_SIM_SYSTEM_PLUGIN_PATH'] = os.pathsep.join(p for p in plugin_paths if p)
     request = f'sdf: {json.dumps(robot_xml)}, name: {json.dumps(value("robot_name"))}'
     return [
+        Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            parameters=[{'robot_description': ParameterValue(robot_xml, value_type=str)}],
+            condition=IfCondition(LaunchConfiguration('use_gz_ros2_control')),
+        ),
         ExecuteProcess(
-            cmd=['gz', 'sim', '-s', '-v', '3', str(world)],
+            cmd=['gz', 'sim', '-s', '-r', '-v', '3', str(world)],
             additional_env=environment, output='screen',
             on_exit=[EmitEvent(event=Shutdown(reason='Gazebo server exited'))]),
         ExecuteProcess(
             cmd=['gz', 'sim', '-g', '-v', '3'],
+            condition=IfCondition(LaunchConfiguration('gui')),
             additional_env=environment, output='screen',
             on_exit=[EmitEvent(event=Shutdown(reason='Gazebo GUI closed'))]),
         ExecuteProcess(
@@ -52,5 +63,7 @@ def generate_launch_description():
         DeclareLaunchArgument('world_name', default_value='empty', description='World name declared inside the SDF'),
         DeclareLaunchArgument('robot_name', default_value='robot'),
         DeclareLaunchArgument('resource_paths', default_value='', description='Colon-separated Gazebo resource directories'),
+        DeclareLaunchArgument('use_gz_ros2_control', default_value='true'),
+        DeclareLaunchArgument('gui', default_value='true'),
         OpaqueFunction(function=setup),
     ])
