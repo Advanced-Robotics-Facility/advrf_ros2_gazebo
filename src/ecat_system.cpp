@@ -65,7 +65,12 @@ public:
       item.id = joint->Get<int32_t>("id");
       item.stiffness = joint->Get<double>("stiffness");
       item.damping = joint->Get<double>("damping");
+      item.hold_when_uncommanded = joint->Get<bool>("hold_when_uncommanded", false).first;
       item.effort_limit = joint->Get<double>("effort_limit", 0.0).first;
+      if (!std::isfinite(item.stiffness) || item.stiffness < 0 ||
+          !std::isfinite(item.damping) || item.damping < 0 ||
+          !std::isfinite(item.effort_limit) || item.effort_limit < 0)
+        throw std::runtime_error("Invalid startup gains or effort limit for Gazebo joint: " + item.name);
       item.entity = model_.JointByName(ecm, item.name);
       if (item.entity == gz::sim::kNullEntity)
         throw std::runtime_error("Gazebo model is missing joint: " + item.name);
@@ -119,6 +124,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto_activate_ = false;
         have_command_ = false;
+        for (auto &joint : joints_)
+          joint.hold_position.reset();
         if (!request->data) startup_hold_ = false;
         active_.store(request->data);
         publish_active();
@@ -143,27 +150,39 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
 
     // simulation-reset safety guard
-    if (info.dt < decltype(info.dt)::zero())
+    if (info.dt < decltype(info.dt)::zero()) {
       have_command_ = false;
+      for (auto &joint : joints_)
+        joint.hold_position.reset();
+    }
 
     // Watchdog
-    const bool fresh = have_command_ && (std::chrono::steady_clock::now() - last_command_ <= command_timeout_);
+    const bool drive_enabled = active_.load() && have_command_ &&
+      (std::chrono::steady_clock::now() - last_command_ <= command_timeout_);
 
     for (auto &joint : joints_) {
+      if (!startup_hold_ && !drive_enabled)
+        joint.hold_position.reset();
+
       // Read simulated joint state from Gazebo
       const auto position = scalar<gz::sim::components::JointPosition>(ecm, joint.entity);
       const auto velocity = scalar<gz::sim::components::JointVelocity>(ecm, joint.entity);
       double effort = 0.0;
       if (position && velocity) {
-        if (startup_hold_) {
-          if (!joint.initial_position)
-            joint.initial_position = *position;
-          // QDD (Quasi-Direct Drive) Actuator Equation
-          effort = joint.stiffness * (*joint.initial_position - *position) - joint.damping * *velocity;
-        } else if (active_.load() && fresh && joint.commanded) {
+        if (startup_hold_ || (drive_enabled && !joint.commanded && joint.hold_when_uncommanded)) {
+          if (!joint.hold_position)
+            joint.hold_position = *position;
+          effort = joint.stiffness * (*joint.hold_position - *position) - joint.damping * *velocity;
+        } else if (drive_enabled && joint.commanded) {
           effort = joint.torque + joint.kp * (joint.position - *position) + joint.kd * (joint.velocity - *velocity);
         }
-        effort = std::clamp(effort, -joint.effort_limit, joint.effort_limit);
+        const double clamped = std::clamp(effort, -joint.effort_limit, joint.effort_limit);
+        if (effort != clamped) {
+          RCLCPP_WARN_THROTTLE(node_->get_logger(), diagnostic_clock_, 2000,
+            "Effort limit reached for %s: requested %.3f, commanded %.3f",
+            joint.name.c_str(), effort, clamped);
+        }
+        effort = clamped;
       }
       joint.applied_effort = effort;
 
@@ -218,12 +237,13 @@ private:
 
     double stiffness{0.0};
     double damping{0.0};
+    bool hold_when_uncommanded{false};
     double kp{0.0};
     double kd{0.0};
 
     bool commanded{false};
     double applied_effort{0.0};
-    std::optional<double> initial_position;
+    std::optional<double> hold_position;
   };
 
   template<class Component>
@@ -251,9 +271,9 @@ private:
       if (!by_id_.count(msg.ecat_id[i]) || !seen.insert(msg.ecat_id[i]).second ||
           !std::isfinite(msg.pos_ref[i]) || !std::isfinite(msg.vel_ref[i]) ||
           !std::isfinite(msg.tor_ref[i]) || !std::isfinite(msg.gain_0[i]) ||
-          !std::isfinite(msg.gain_1[i]))
+          !std::isfinite(msg.gain_1[i]) || msg.gain_0[i] < 0 || msg.gain_1[i] < 0)
       {
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Rejected invalid motor reference or EtherCAT ID");
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Rejected invalid motor reference, gain or EtherCAT ID");
         return;
       }
     }
@@ -264,8 +284,13 @@ private:
         return;
     startup_hold_ = false;
 
-    for (auto &joint : joints_)
-        joint.commanded = false;
+    const auto received = std::chrono::steady_clock::now();
+    const bool command_expired = have_command_ && received - last_command_ > command_timeout_;
+    for (auto &joint : joints_) {
+      joint.commanded = false;
+      if (command_expired)
+        joint.hold_position.reset();
+    }
 
     for (std::size_t i = 0; i < size; ++i) {
       auto &joint = joints_[by_id_.at(msg.ecat_id[i])];
@@ -275,11 +300,12 @@ private:
       joint.kp = msg.gain_0[i];
       joint.kd = msg.gain_1[i];
       joint.commanded = true;
+      joint.hold_position.reset();
     }
 
     if (!active_.exchange(true))
         publish_active();
-    last_command_ = std::chrono::steady_clock::now();
+    last_command_ = received;
     have_command_ = true;
   }
 
@@ -296,6 +322,7 @@ private:
   std::vector<Joint> joints_;
   std::unordered_map<int32_t, std::size_t> by_id_;
   std::mutex mutex_;
+  rclcpp::Clock diagnostic_clock_{RCL_STEADY_TIME};
   std::chrono::steady_clock::time_point last_command_;
   std::chrono::milliseconds command_timeout_{100};
   std::chrono::milliseconds feedback_period_{4};
